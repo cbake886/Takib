@@ -1,0 +1,77 @@
+import { INDEX_NAME } from '../common';
+import datasetJSON from './dataset/searchguard_demo_accounts.json';
+
+function indexDatasetOnceIfAbsent({ clusterClient, logger }) {
+  return async function () {
+    const { body: doesExist } = await clusterClient.asInternalUser.indices.exists({
+      index: INDEX_NAME,
+    });
+
+    if (!doesExist) {
+      logger.info(
+        `Index ${INDEX_NAME} doesn't exist. Start indexing data, it will take some time, please wait ...`
+      );
+
+      try {
+        await clusterClient.asInternalUser.indices.create({ index: INDEX_NAME });
+      } catch (error) {
+        throw new Error(`Failed to create index ${INDEX_NAME}. ${error.stack}`);
+      }
+
+      // Create dataset that matches requirements of the
+      // Elasticsearch Bulk API payload.
+      const dataset = datasetJSON.flatMap(({ _id, ...doc }) => [
+        { index: { _id, _index: INDEX_NAME } },
+        doc,
+      ]);
+
+      let bulkResp;
+
+      try {
+        bulkResp = await clusterClient.asInternalUser.bulk({ refresh: true, body: dataset });
+        bulkResp = bulkResp.body;
+        logger.info(`Finished indexing data in ${INDEX_NAME} index!`);
+      } catch (error) {
+        throw new Error(`Failed to index the dataset. ${error.stack}`);
+      }
+
+      // Log errors if any.
+      if (bulkResp && bulkResp.errors) {
+        const errored = [];
+        bulkResp.items.forEach((action, i) => {
+          const operation = Object.keys(action)[0];
+          if (action[operation].error) {
+            errored.push({
+              status: action[operation].status,
+              error: action[operation].error,
+              operation: dataset[i * 2],
+              document: dataset[i * 2 + 1],
+            });
+          }
+        });
+
+        logger.error('Some documents were not indexed. Probably a mapping issue.');
+        logger.error(errored);
+      }
+    }
+  };
+}
+
+function retryClusterCall({ clusterClient, logger, retryInMS = 3000 }, fn) {
+  let interval;
+  interval = setInterval(async () => {
+    try {
+      const { body: { status = 'red' } = {} } = await clusterClient.asInternalUser.cluster.health();
+      logger.info(`Elasticsearch cluster health is ${status}.`);
+
+      if (status === 'green' || status === 'yellow') {
+        clearInterval(interval);
+        if (typeof fn === 'function') {
+          fn();
+        }
+      }
+    } catch (error) {
+      logger.error(error);
+    }
+  }, retryInMS);
+}
